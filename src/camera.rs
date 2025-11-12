@@ -93,14 +93,14 @@ impl Camera {
         }
 
         // Zoom controls (distance from target) - arrow keys
-        if window.is_key_down(KeyboardKey::KEY_UP) {
+        if window.is_key_down(KeyboardKey::KEY_R) {
             self.distance -= self.zoom_speed;
             if self.distance < 0.5 {
                 self.distance = 0.5; // Prevent camera from going too close
             }
             self.update_eye_position();
         }
-        if window.is_key_down(KeyboardKey::KEY_DOWN) {
+        if window.is_key_down(KeyboardKey::KEY_F) {
             self.distance += self.zoom_speed;
             self.update_eye_position();
         }

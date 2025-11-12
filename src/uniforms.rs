@@ -4,6 +4,8 @@ use raylib::prelude::*;
 pub struct Uniforms {
     pub time: f32,         // segundos
     pub resolution: Vector2, // tamaño ventana en píxeles
+    pub temp: f32,
+    pub intensity: f32,
 }
 
 // Convierte Color (0..255) a vec3 0..1

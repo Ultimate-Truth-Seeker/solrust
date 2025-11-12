@@ -14,7 +14,6 @@ use std::time::Instant;
 mod framebuffer;
 mod camera;
 mod matrix;
-mod line;
 mod triangle;
 mod fragment;
 mod light;
@@ -122,39 +121,36 @@ fn apply_vertex_shader(v: Vector3, shader: &VertexShader, time: f32) -> Vector3 
 }
 
 fn fragment_shader(fragment: &Fragment, u: &Uniforms) -> Vector3 {
-    // Normalized device-like screen UV in [-1,1]
-    let uv = Vector2::new(
-        (fragment.position.x as f32 / u.resolution.x) * 2.0 - 1.0,
-        (fragment.position.y as f32 / u.resolution.y) * 2.0 - 1.0,
-    );
+    // Use object-space direction for stable texturing on the sphere surface
+    let mut dir = fragment.obj_position;
+    let len = (dir.x*dir.x + dir.y*dir.y + dir.z*dir.z).sqrt();
+    if len > 0.0 { dir = Vector3::new(dir.x/len, dir.y/len, dir.z/len); }
 
-    // Radial falloff to keep a circular star look even if triangles bleed
-    let r = (uv.x*uv.x + uv.y*uv.y).sqrt();
-    let edge = (1.0 - ((r - 0.9)/(1.0 - 0.9)).clamp(0.0,1.0)).powf(3.0); // soft limb darkening
-
-    // Animated FBM turbulence in 3D: use uv as XY, time as Z; loop time every ~8s for cyclic effect
-    let tloop = (u.time % 8.0) / 8.0; // [0,1)
-    let p3 = Vector3::new(uv.x*3.0, uv.y*3.0, tloop*8.0);
+    // FBM turbulence driven by object-space, time-cycled
+    let tloop = (u.time % 8.0) / 8.0;
+    let p3 = Vector3::new(dir.x*3.0, dir.y*3.0, tloop*8.0);
     let turb = fbm(p3, 5, 2.0, 0.55);
 
-    // Intensity and temperature mapping
-    let core = (1.2 - r).clamp(0.0, 1.0);
-    let intensity = (core * 0.7 + turb * 0.6).clamp(0.0, 1.0);
-    let color_base = temperature_to_rgb(intensity);
+    // Core intensity based on how close to the disc center it projects (approx with dir.z)
+    // dir.z ~ facing viewer if camera looks down -Z; use abs to be camera-agnostic
+    let facing = dir.z.abs();
+    let base_core = facing.clamp(0.0, 1.0);
 
-    // Emission spikes (solar activity) – faster layer mixed in
-    let spikes = (value_noise3(Vector3::new(uv.x*10.0 + u.time*1.7, uv.y*10.0 - u.time*1.3, u.time*0.5))*2.0-1.0).abs();
+    // User controls: temp in [0,1], intensity scaler ~ [0,2]
+    let intensity = ((base_core * 0.7 + turb * 0.6) * u.intensity).clamp(0.0, 1.0);
+
+    // Temperature affects gradient selection
+    let color_base = temperature_to_rgb(((intensity + u.temp*0.8)*0.7).clamp(0.0,1.0));
+
+    // Emission spikes add energetic flicker
+    let spikes = (value_noise3(Vector3::new(dir.x*10.0 + u.time*1.7, dir.y*10.0 - u.time*1.3, u.time*0.5))*2.0-1.0).abs();
     let emission = (0.6*intensity + 0.8*spikes).clamp(0.0, 1.5);
 
-    // Final color with emission; clamp to [0,1]
-    let rgb = Vector3::new(
+    Vector3::new(
         (color_base.x * emission).clamp(0.0, 1.0),
         (color_base.y * emission).clamp(0.0, 1.0),
         (color_base.z * emission).clamp(0.0, 1.0),
-    );
-
-    // Apply limb darkening/edge softening
-    Vector3::new(rgb.x * edge, rgb.y * edge, rgb.z * edge)
+    )
 }
 
 
@@ -199,17 +195,22 @@ pub fn render(
     viewport: &Matrix,
     time: f32,
     resolution: Vector2,
+    temp: f32,
+    intensity: f32,
 ) {
     let light = Light::new(Vector3::new(0.0, 10.0, 0.0));
     let mut transformed_vertices = Vec::with_capacity(vertex_array.len());
+    let mut obj_vertices_after_vs = Vec::with_capacity(vertex_array.len());
     for vertex in vertex_array {
         let v_obj = apply_vertex_shader(*vertex, vshader, time);
+        obj_vertices_after_vs.push(v_obj);
         let transformed = transform(v_obj, translation, scale, rotation, view, projection, viewport);
         transformed_vertices.push(transformed);
     }
 
     // Primitive Assembly Stage
     let mut triangles = Vec::new();
+    let mut obj_tris = Vec::new();
     for i in (0..transformed_vertices.len()).step_by(3) {
         if i + 2 < transformed_vertices.len() {
             triangles.push([
@@ -217,18 +218,25 @@ pub fn render(
                 transformed_vertices[i + 1].clone(),
                 transformed_vertices[i + 2].clone(),
             ]);
+            obj_tris.push([
+                obj_vertices_after_vs[i].clone(),
+                obj_vertices_after_vs[i + 1].clone(),
+                obj_vertices_after_vs[i + 2].clone(),
+            ]);
         }
     }
 
     // Rasterization Stage
     let mut fragments = Vec::new();
-    for tri in &triangles {
-        fragments.extend(triangle(&tri[0], &tri[1], &tri[2], &light));
+    for (tri, obj_tri) in triangles.iter().zip(obj_tris.iter()) {
+        fragments.extend(triangle(&tri[0], &tri[1], &tri[2], &obj_tri[0], &obj_tri[1], &obj_tri[2], &light));
     }
     
     let uniforms = Uniforms {
         time,
         resolution,
+        temp,
+        intensity,
     };
 
     // Fragment Processing Stage
@@ -261,6 +269,9 @@ fn main() {
     let mut framebuffer = Framebuffer::new(window_width as u32, window_height as u32, Color::BLACK);
     framebuffer.set_background_color(Color::new(4, 12, 36, 255));
 
+    let mut temp_control: f32 = 0.5;      // 0 (rojo) … 1 (blanco/azulado)
+    let mut intensity_control: f32 = 1.0; // 1 = normal, >1 más brillante
+
     // --- Scene entities ---
     let mut entities: Vec<Entity> = vec![
         // The ship we will follow
@@ -277,7 +288,7 @@ fn main() {
 
 
     let mut camera = Camera::new(
-        Vector3::new(0.0, 0.0, 70.0),
+        Vector3::new(0.0, 0.0, 17.0),
         Vector3::new(0.0, 0.0, 0.0),
         Vector3::new(0.0, 1.0, 0.0),
     );
@@ -287,6 +298,13 @@ fn main() {
     while !window.window_should_close() {
         framebuffer.clear();
         camera.process_input(&window);
+
+        if window.is_key_down(KeyboardKey::KEY_RIGHT) { temp_control += 0.3 * window.get_frame_time(); }
+        if window.is_key_down(KeyboardKey::KEY_LEFT)  { temp_control -= 0.3 * window.get_frame_time(); }
+        if window.is_key_down(KeyboardKey::KEY_UP)    { intensity_control += 0.5 * window.get_frame_time(); }
+        if window.is_key_down(KeyboardKey::KEY_DOWN)  { intensity_control -= 0.5 * window.get_frame_time(); }
+        temp_control = temp_control.clamp(0.0, 1.0);
+        intensity_control = intensity_control.clamp(0.2, 2.0);
 
         // Global time and resolution
         let time = start_time.elapsed().as_secs_f32();
@@ -319,6 +337,8 @@ fn main() {
                 &viewport,
                 time,
                 resolution,
+                temp_control,
+                intensity_control,
 
             );
         }
